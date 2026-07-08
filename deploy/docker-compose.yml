@@ -1,0 +1,246 @@
+# Стенд traceforge, sprint 01. Профиль по умолчанию поднимает platform-ветку
+# (redpanda + collector + minio + postgres + clickhouse). Langfuse — тяжёлый и
+# опциональный: docker compose --profile full up -d.
+#
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# Хостовые порты: collector 4317/4318, redpanda 19092 (kafka), console 8080,
+# minio 9000/9001, postgres 5432, clickhouse 8123/9002.
+
+name: traceforge
+
+services:
+  # --- Kafka API (Redpanda: легче Kafka локально, тот же протокол) ---
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      # internal — для контейнеров (collector), external — для хоста (rawread)
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"
+      - "9644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health -X brokers=localhost:9092 | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Создаёт топик otlp.raw.spans один раз при старте и завершается.
+  redpanda-init:
+    image: redpandadata/redpanda:v24.2.7
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >
+        rpk topic create otlp.raw.spans
+        -X brokers=redpanda:9092
+        --partitions 6
+        --replicas 1
+        --topic-config retention.ms=604800000
+        || true
+    restart: "no"
+
+  # Веб-консоль Redpanda (опционально, удобно смотреть топик).
+  redpanda-console:
+    image: redpandadata/console:v2.7.2
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports:
+      - "8080:8080"
+
+  # --- OTel Collector (fan-out) ---
+  otel-collector:
+    # NB: тег 0.116.0 в arm64-манифесте битый (динамически слинкованный бинарь
+    # без glibc-загрузчика -> "exec /otelcol-contrib: no such file or directory").
+    # 0.123.0 проверен рабочим на arm64; конфиг провалидирован под этот тег.
+    image: otel/opentelemetry-collector-contrib:0.123.0
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    volumes:
+      - ./otel-collector.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "13133:13133" # health_checkа
+    # У contrib-образа нет shell/curl, поэтому healthcheck снаружи не описываем;
+    # порт health_check:13133 открыт для ручной/внешней проверки.
+
+  # --- MinIO (S3) для CAS-сегментов и архивных бандлов будущих спринтов ---
+  minio:
+    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Создаёт бакеты и завершается.
+  minio-init:
+    image: minio/mc:RELEASE.2024-10-08T09-37-26Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        until mc alias set local http://minio:9000 minioadmin minioadmin; do sleep 1; done;
+        mc mb --ignore-existing local/traceforge-dedup;
+        mc mb --ignore-existing local/traceforge-archive;
+    restart: "no"
+
+  # --- Postgres: пустая БД под dedup-index (sprint 02) ---
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: traceforge
+      POSTGRES_USER: traceforge
+      POSTGRES_PASSWORD: traceforge
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U traceforge -d traceforge"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # --- ClickHouse: пустой под P3/архив-индекс ---
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    environment:
+      CLICKHOUSE_DB: traceforge
+      CLICKHOUSE_USER: traceforge
+      CLICKHOUSE_PASSWORD: traceforge
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "8123:8123"
+      - "9002:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - ch-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # --- Langfuse (profile full, тяжёлый, локально в смоук не входит) ---
+  # Зеркалит upstream self-host compose Langfuse v3. Для реального side-tap
+  # раскомментируйте otlphttp/langfuse в otel-collector.yaml.
+  langfuse-postgres:
+    image: postgres:16-alpine
+    profiles: ["full"]
+    environment:
+      POSTGRES_DB: langfuse
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+    volumes:
+      - lf-pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  langfuse-clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    profiles: ["full"]
+    environment:
+      CLICKHOUSE_USER: langfuse
+      CLICKHOUSE_PASSWORD: langfuse
+    volumes:
+      - lf-ch-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  langfuse-redis:
+    image: redis:7-alpine
+    profiles: ["full"]
+    command: ["redis-server", "--requirepass", "langfuse"]
+
+  langfuse-web:
+    image: langfuse/langfuse:3
+    profiles: ["full"]
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: langfuse
+      CLICKHOUSE_PASSWORD: langfuse
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      REDIS_CONNECTION_STRING: redis://:langfuse@langfuse-redis:6379
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: dev-secret-change-me
+      SALT: dev-salt-change-me
+      ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+      # Langfuse хранит blob-и в S3; переиспользуем наш MinIO.
+      LANGFUSE_S3_EVENT_UPLOAD_ENABLED: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: traceforge-archive
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minioadmin
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: minioadmin
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+    ports:
+      - "3000:3000"
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    profiles: ["full"]
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@langfuse-postgres:5432/langfuse
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: langfuse
+      CLICKHOUSE_PASSWORD: langfuse
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      REDIS_CONNECTION_STRING: redis://:langfuse@langfuse-redis:6379
+      SALT: dev-salt-change-me
+      ENCRYPTION_KEY: 0000000000000000000000000000000000000000000000000000000000000000
+
+volumes:
+  redpanda-data:
+  minio-data:
+  pg-data:
+  ch-data:
+  lf-pg-data:
+  lf-ch-data:

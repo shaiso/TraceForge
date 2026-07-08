@@ -1,0 +1,64 @@
+# Конфиг коллектора: fan-out одного OTLP-потока в две независимые ветки.
+#   traces/platform -> Kafka (наш поток, side-tap)
+#   traces/langfuse -> debug (по умолчанию) | otlphttp/langfuse (profile full)
+# Ветки независимы: падение Kafka не мешает ветке langfuse (T3 DoD).
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    send_batch_size: 512
+    timeout: 5s
+
+exporters:
+  kafka:
+    brokers: [redpanda:9092]
+    topic: otlp.raw.spans
+    encoding: otlp_proto
+    partition_traces_by_id: true        # key = trace_id -> спаны трейса в одну партицию
+    producer:
+      compression: zstd
+    sending_queue:
+      enabled: true
+      queue_size: 10000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 30s
+      max_elapsed_time: 0               # ретраить бесконечно: platform-ветка не должна терять спаны
+
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+  # --- profile full: настоящий side-tap в Langfuse (принимает только OTLP/HTTP) ---
+  # otlphttp/langfuse:
+  #   endpoint: http://langfuse-web:3000/api/public/otel
+  #   headers:
+  #     Authorization: "Basic ${env:LANGFUSE_AUTH}"   # base64("pk-...:sk-...")
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces/platform:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [kafka]
+    traces/langfuse:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]                # profile full: заменить на [otlphttp/langfuse]
+  telemetry:
+    logs:
+      level: info
