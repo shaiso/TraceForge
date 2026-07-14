@@ -40,6 +40,10 @@ type Config struct {
 	Workers  int           // число параллельных «звонков» (сессий)
 	Duration time.Duration // длительность генерации
 	Schema   string        // схема контента LLM: "A" (плоская) или "B" (input/output messages)
+	// LongContent — режим длинных диалогов: реплики раздуваются до ~2.5 КБ, а число
+	// ходов растёт. Транскрипт достигает десятков КБ с длинными общими префиксами —
+	// на таком FastCDC даёт партиал-дедуп, а whole-field почти нет (для сравнения в T8).
+	LongContent bool
 }
 
 // stats — атомарные счётчики прогона.
@@ -183,6 +187,9 @@ func (g *Generator) runSession(ctx context.Context, r *rand.Rand) bool {
 
 	history := make([]message, 0, 20)
 	turns := 3 + r.IntN(8) // 3..10
+	if g.cfg.LongContent {
+		turns = 8 + r.IntN(8) // 8..15 ходов -> транскрипт до ~75 КБ
+	}
 	for i := 0; i < turns; i++ {
 		if !g.newTrace(ctx) {
 			return false
@@ -233,10 +240,15 @@ func (g *Generator) dialogTrace(ctx context.Context, r *rand.Rand, ver string, h
 	spanCount++
 
 	// Реплика спамера дополняет растущий префикс диалога.
-	*history = append(*history, message{Role: "user", Content: spammerPhrases[r.IntN(len(spammerPhrases))]})
+	phrase := spammerPhrases[r.IntN(len(spammerPhrases))]
+	reply := agentReplies[r.IntN(len(agentReplies))]
+	if g.cfg.LongContent {
+		phrase = padTo(phrase, 2500)
+		reply = padTo(reply, 2500)
+	}
+	*history = append(*history, message{Role: "user", Content: phrase})
 
 	_, chat := g.tr[svcDialog].Start(tctx, "chat gpt-4o-mini")
-	reply := agentReplies[r.IntN(len(agentReplies))]
 	g.applyLLM(chat, r, ver, *history, reply, "gpt-4o-mini", "openai")
 	chat.End()
 	spanCount++
@@ -276,6 +288,10 @@ func (g *Generator) applyLLM(span trace.Span, r *rand.Rand, ver string, msgs []m
 		g.strAttr(span, "gen_ai.output.messages", toJSON([]message{{Role: "assistant", Content: output}}))
 	}
 	span.SetAttributes(
+		// Идентичность промпт-шаблона (semconv) — вход для template-aware дедупа (T9/фаза 2):
+		// системка версионируется (v3/v4), имя стабильно. Научрук добавит template_id/vars.
+		attribute.String("gen_ai.prompt.name", "antispam.system"),
+		attribute.String("gen_ai.prompt.version", ver),
 		attribute.String("gen_ai.request.model", model),
 		attribute.Float64("gen_ai.request.temperature", 0.2+r.Float64()*0.7),
 		attribute.Int("gen_ai.usage.input_tokens", estTokens(sys, msgs)),

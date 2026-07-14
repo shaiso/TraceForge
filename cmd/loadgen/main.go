@@ -19,6 +19,7 @@ func main() {
 	workers := flag.Int("workers", 16, "число параллельных сессий-звонков")
 	duration := flag.Duration("duration", 60*time.Second, "длительность генерации")
 	schema := flag.String("schema", "B", "схема контента LLM: A (плоская) или B (input/output messages)")
+	long := flag.Bool("long", false, "длинные диалоги (реплики ~2.5КБ, транскрипт до ~75КБ) — для демо партиал-дедупа FastCDC")
 	flag.Parse()
 
 	if *schema != "A" && *schema != "B" {
@@ -30,18 +31,19 @@ func main() {
 	defer stop()
 
 	gen, err := scenario.New(ctx, scenario.Config{
-		Endpoint: *endpoint,
-		RPS:      *rps,
-		Workers:  *workers,
-		Duration: *duration,
-		Schema:   *schema,
+		Endpoint:    *endpoint,
+		RPS:         *rps,
+		Workers:     *workers,
+		Duration:    *duration,
+		Schema:      *schema,
+		LongContent: *long,
 	})
 	if err != nil {
 		log.Fatalf("инициализация генератора: %v", err)
 	}
 
-	log.Printf("loadgen старт: endpoint=%s rps=%d workers=%d duration=%s schema=%s",
-		*endpoint, *rps, *workers, *duration, *schema)
+	log.Printf("loadgen старт: endpoint=%s rps=%d workers=%d duration=%s schema=%s long=%v",
+		*endpoint, *rps, *workers, *duration, *schema, *long)
 	if err := gen.Run(ctx); err != nil {
 		log.Fatalf("прогон: %v", err)
 	}

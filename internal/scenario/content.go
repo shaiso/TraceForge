@@ -21,6 +21,25 @@ func toJSON(v any) string {
 	return string(b)
 }
 
+// padTo детерминированно раздувает s повторением до длины >= n. Режим -long: делает
+// реплики диалога крупными, чтобы накопительный транскрипт (gen_ai.input.messages)
+// рос до десятков КБ. Тогда соседние спаны сессии делят длинный общий префикс —
+// это показывает партиал-дедуп FastCDC (whole-field на таком даёт 0 общих). Один и
+// тот же вход даёт байт-в-байт один результат, поэтому дедуп между сессиями сохраняется.
+func padTo(s string, n int) string {
+	if len(s) >= n {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(n + len(s))
+	b.WriteString(s)
+	for b.Len() < n {
+		b.WriteString(" | ")
+		b.WriteString(s)
+	}
+	return b.String()
+}
+
 // estTokens — грубая оценка числа токенов (символы/4) для правдоподобных счётчиков usage.
 func estTokens(sys string, msgs []message) int {
 	n := len(sys)
