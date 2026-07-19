@@ -4,7 +4,8 @@ DURATION ?= 60s
 SCHEMA   ?= B
 CHUNKER  ?= fastcdc
 
-.PHONY: build tidy up down logs gen read smoke dedup bench smoke-dedup demo-p1 inspect reset-p1
+.PHONY: build tidy up down logs gen read smoke dedup bench smoke-dedup demo-p1 inspect reset-p1 \
+        archiver restore-api retention-verify reset-p2 smoke-restore inspect-archive
 
 ## build: собрать все бинари
 build:
@@ -62,10 +63,60 @@ smoke:
 read:
 	go run ./cmd/rawread -duration=15s
 
+## archiver: запустить P2-архиватор (spans.thin -> бандлы S3 + archive_index CH)
+archiver:
+	go run ./cmd/archiver -duration=$(DURATION)
+
+## restore-api: поднять HTTP restore-сервис (GET /traces/{id}, /traces?from=&to=)
+restore-api:
+	go run ./cmd/restore-api -addr=:8090
+
+## retention-verify: verify окна + план удаления (FROM/TO в RFC3339)
+FROM ?= $(shell date -u -v-1d +%Y-%m-%dT00:00:00Z)
+TO   ?= $(shell date -u -v+1d +%Y-%m-%dT00:00:00Z)
+retention-verify:
+	go run ./cmd/retention verify --from $(FROM) --to $(TO) --project antispam --sample 10
+
+## reset-p2: чистый старт архива — TRUNCATE archive_index + очистка бакета бандлов
+reset-p2:
+	@echo ">>> чищу archive_index и бакет traceforge-archive..."
+	@$(COMPOSE) exec -T clickhouse clickhouse-client -u traceforge --password traceforge -d traceforge -q "TRUNCATE TABLE IF EXISTS archive_index;" >/dev/null 2>&1 || true
+	@$(COMPOSE) exec -T minio sh -c \
+	  "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null 2>&1; \
+	   mc rm --recursive --force local/traceforge-archive >/dev/null 2>&1 || true"
+	@echo ">>> состояние P2 очищено."
+
+## smoke-restore: end-to-end петля gen -> P1 -> P2 -> архив -> restore (одиночный+диапазон)
+smoke-restore:
+	$(COMPOSE) up -d
+	@echo "жду 15с, пока стенд устаканится..."
+	@sleep 15
+	@$(MAKE) --no-print-directory reset-p1
+	@$(MAKE) --no-print-directory reset-p2
+	@echo ">>> gen -> P1 -> P2 (наполняю архив)..."
+	go run ./cmd/loadgen -rps=$(RPS) -duration=$(DURATION) -schema=B -long
+	go run ./cmd/dedup -chunker=$(CHUNKER) -duration=45s
+	go run ./cmd/archiver -duration=30s
+	@echo ">>> restore: живой E2E (одиночный, все ref резолвятся)..."
+	go test ./internal/restore/... -run TestRestoreFromLiveArchive -count=1 -v
+	@echo ">>> retention verify (диапазон окна + план удаления)..."
+	@$(MAKE) --no-print-directory retention-verify
+
+## inspect-archive: срезы архива (archive_index + бандлы в S3)
+inspect-archive:
+	@echo "===== ClickHouse: archive_index ====="
+	@$(COMPOSE) exec -T clickhouse clickhouse-client -u traceforge --password traceforge -d traceforge -q \
+	  "SELECT count() AS rows, uniqExact(trace_id) AS traces, uniqExact(bundle_key) AS bundles FROM archive_index FINAL;"
+	@$(COMPOSE) exec -T clickhouse clickhouse-client -u traceforge --password traceforge -d traceforge -q \
+	  "SELECT partition, sum(rows) AS rows FROM system.parts WHERE table='archive_index' AND active GROUP BY partition ORDER BY partition;"
+	@echo "===== MinIO: бандлы архива ====="
+	@$(COMPOSE) exec -T minio sh -c \
+	  "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null 2>&1; mc ls --recursive --summarize local/traceforge-archive" 2>/dev/null | tail -8
+
 ## reset-p1: чистый старт CAS — TRUNCATE dedup_index + очистка бакета MinIO + пересоздание spans.thin
 reset-p1:
 	@echo ">>> чищу dedup_index, бакет MinIO и топик spans.thin (чистый замер с нуля)..."
-	@$(COMPOSE) exec -T postgres psql -U traceforge -c "TRUNCATE dedup_index;" >/dev/null
+	@$(COMPOSE) exec -T postgres psql -U traceforge -c "TRUNCATE dedup_index;" >/dev/null 2>&1 || true
 	@$(COMPOSE) exec -T minio sh -c \
 	  "mc alias set local http://localhost:9000 minioadmin minioadmin >/dev/null 2>&1; \
 	   mc rm --recursive --force local/traceforge-dedup >/dev/null 2>&1; \
