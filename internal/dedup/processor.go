@@ -51,10 +51,18 @@ func NewProcessor(ex *Extractor, ch Chunker, ix *Index, pk *SegmentPacker) *Proc
 // thinEnvelope — тонкий спан, формат v1: денормализованные service/scope + сам
 // OTLP-спан (protojson) с тяжёлым контентом, заменённым на ref. Обратимость
 // бит-в-бит: restore меняет ref обратно на байты из CAS -> исходный спан.
+//
+// Resource/ScopeFull (T0): тонкий спан — единственный носитель истории после
+// retention Kafka, поэтому он обязан нести ВСЁ, кроме вынесенного в CAS. Голых
+// Service/Scope-строк недостаточно: resource-атрибуты сверх service.name (напр.
+// service.version) и scope version/attributes иначе молча теряются. Поля optional
+// (omitempty) — старые тонкие спаны без них декодируются как раньше.
 type thinEnvelope struct {
-	Service string          `json:"service"`
-	Scope   string          `json:"scope,omitempty"`
-	Span    json.RawMessage `json:"span"`
+	Service   string          `json:"service"`
+	Scope     string          `json:"scope,omitempty"`
+	Resource  json.RawMessage `json:"resource,omitempty"`   // полный resource (protojson)
+	ScopeFull json.RawMessage `json:"scope_full,omitempty"` // полный scope: name+version+attrs
+	Span      json.RawMessage `json:"span"`
 }
 
 // Process обрабатывает один спан: мутирует f.Span (тяжёлые поля -> ref), заносит
@@ -180,13 +188,24 @@ func marshalThin(f otlp.FlatSpan) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dedup: protojson спана: %w", err)
 	}
-	scope := ""
-	if f.Scope != nil {
-		scope = f.Scope.GetName()
+	env := thinEnvelope{Service: f.ServiceName, Span: spanJSON}
+	// Полный resource (service.version и пр.) — иначе теряется всё сверх service.name.
+	if f.Resource != nil {
+		resJSON, err := protojson.Marshal(f.Resource)
+		if err != nil {
+			return nil, fmt.Errorf("dedup: protojson resource: %w", err)
+		}
+		env.Resource = resJSON
 	}
-	return json.Marshal(thinEnvelope{
-		Service: f.ServiceName,
-		Scope:   scope,
-		Span:    spanJSON,
-	})
+	// Scope: строку-имя оставляем для дешёвой денормализации; полный scope (с
+	// version/attributes) кладём рядом для бит-в-бит восстановления.
+	if f.Scope != nil {
+		env.Scope = f.Scope.GetName()
+		scopeJSON, err := protojson.Marshal(f.Scope)
+		if err != nil {
+			return nil, fmt.Errorf("dedup: protojson scope: %w", err)
+		}
+		env.ScopeFull = scopeJSON
+	}
+	return json.Marshal(env)
 }
