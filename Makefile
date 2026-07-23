@@ -4,8 +4,11 @@ DURATION ?= 60s
 SCHEMA   ?= B
 CHUNKER  ?= fastcdc
 
+SEED_ROWS ?= 3000000
+
 .PHONY: build tidy up down logs gen read smoke dedup bench smoke-dedup demo-p1 inspect reset-p1 \
-        archiver restore-api retention-verify reset-p2 smoke-restore inspect-archive
+        archiver restore-api retention-verify reset-p2 smoke-restore inspect-archive \
+        chsink batchjob marts seed-marts reset-p3 smoke-p3
 
 ## build: собрать все бинари
 build:
@@ -159,3 +162,48 @@ inspect:
 	@echo "  Redpanda Console : http://localhost:8080         (топики, сообщения spans.thin)"
 	@echo "  MinIO Console    : http://localhost:9001         (minioadmin/minioadmin, бакет traceforge-dedup)"
 	@echo "  P1 /metrics      : http://localhost:9464/metrics (ТОЛЬКО пока запущен make dedup)"
+
+# ---- Sprint 04: SDK-процессоры (P3 стрим + батч) + витрины ----
+
+CH_CLIENT := $(COMPOSE) exec -T clickhouse clickhouse-client -u traceforge --password traceforge -d traceforge
+
+## chsink: запустить P3 CH-sink (spans.thin -> tf_spans + user_sessions), на SDK
+chsink:
+	go run ./cmd/chsink -duration=$(DURATION)
+
+## batchjob: классификация причин завершения по окну (FROM/TO) -> session_end_reason
+batchjob:
+	go run ./cmd/batchjob --from $(FROM) --to $(TO)
+
+## marts: продуктовые витрины + аудит качества с таймингом (make marts)
+marts:
+	@$(CH_CLIENT) --multiquery --time --format=PrettyCompact < deploy/marts.sql
+
+## seed-marts: массовая заливка слоя под замер витрин «на объёме» (SEED_ROWS=..)
+seed-marts:
+	@echo ">>> заливаю ~$(SEED_ROWS) строк в tf_spans (+session_end_reason, +user_sessions)..."
+	@$(CH_CLIENT) --multiquery --param_rows=$(SEED_ROWS) < deploy/seed_marts.sql
+	@$(CH_CLIENT) -q "SELECT 'tf_spans' AS t, count() FROM tf_spans UNION ALL SELECT 'user_sessions', count() FROM user_sessions UNION ALL SELECT 'session_end_reason', count() FROM session_end_reason"
+
+## reset-p3: чистый агрегационный слой (TRUNCATE tf_spans/user_sessions/session_end_reason)
+reset-p3:
+	@echo ">>> чищу tf_spans, user_sessions, session_end_reason..."
+	@$(CH_CLIENT) --multiquery -q "TRUNCATE TABLE IF EXISTS tf_spans; TRUNCATE TABLE IF EXISTS user_sessions; TRUNCATE TABLE IF EXISTS session_end_reason;" 2>/dev/null || true
+	@echo ">>> слой P3 очищен."
+
+## smoke-p3: вся петля gen -> P1 -> P2 -> P3(стрим) -> батч -> витрины одной командой
+smoke-p3:
+	$(COMPOSE) up -d
+	@echo "жду 15с, пока стенд устаканится..."
+	@sleep 15
+	@$(MAKE) --no-print-directory reset-p1
+	@$(MAKE) --no-print-directory reset-p2
+	@$(MAKE) --no-print-directory reset-p3
+	@echo ">>> gen -> P1 -> P2 -> P3 -> батч..."
+	go run ./cmd/loadgen -rps=$(RPS) -duration=$(DURATION) -schema=B
+	go run ./cmd/dedup -chunker=$(CHUNKER) -duration=45s
+	go run ./cmd/archiver -duration=30s
+	go run ./cmd/chsink -duration=30s
+	@$(MAKE) --no-print-directory batchjob
+	@echo ">>> витрины (стрим+батч совместно):"
+	@$(MAKE) --no-print-directory marts
