@@ -11,8 +11,10 @@ import (
 
 	"github.com/klauspost/compress/zstd"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
 	"traceforge/internal/archive"
 	"traceforge/internal/restore"
@@ -107,6 +109,52 @@ func sysInstr(rs restore.RestoredSpan) string {
 		}
 	}
 	return ""
+}
+
+// TestDecodeThinFrame_ResourceScope (T0): нижний декодер восстанавливает полные
+// resource/scope, а не только денормализованные service/scope-строки.
+func TestDecodeThinFrame_ResourceScope(t *testing.T) {
+	enc, _ := zstd.NewWriter(nil)
+	defer enc.Close()
+	dec, _ := zstd.NewReader(nil)
+	defer dec.Close()
+
+	res := &resourcepb.Resource{Attributes: []*commonpb.KeyValue{
+		{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "dialog-agent"}}},
+		{Key: "service.version", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: "1.0.0"}}},
+	}}
+	scope := &commonpb.InstrumentationScope{Name: "traceforge/loadgen", Version: "2.1.0"}
+	span := &tracepb.Span{Name: "op"}
+
+	resJSON, _ := protojson.Marshal(res)
+	scopeJSON, _ := protojson.Marshal(scope)
+	spanJSON, _ := protojson.Marshal(span)
+	line, err := json.Marshal(struct {
+		Service   string          `json:"service"`
+		Scope     string          `json:"scope"`
+		Resource  json.RawMessage `json:"resource,omitempty"`
+		ScopeFull json.RawMessage `json:"scope_full,omitempty"`
+		Span      json.RawMessage `json:"span"`
+	}{"dialog-agent", scope.Name, resJSON, scopeJSON, spanJSON})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	frame := enc.EncodeAll(append(line, '\n'), nil)
+	spans, err := restore.DecodeThinFrame(dec, frame)
+	if err != nil {
+		t.Fatalf("DecodeThinFrame: %v", err)
+	}
+	if len(spans) != 1 {
+		t.Fatalf("жду 1 спан, got %d", len(spans))
+	}
+	rs := spans[0]
+	if rs.Resource == nil || !proto.Equal(rs.Resource, res) {
+		t.Errorf("resource не восстановлен: %v", rs.Resource)
+	}
+	if rs.ScopeFull == nil || !proto.Equal(rs.ScopeFull, scope) {
+		t.Errorf("scope не восстановлен: %v", rs.ScopeFull)
+	}
 }
 
 // TestRestoreSingle: ref во фрейме бандла резолвится в исходный контент из CAS.

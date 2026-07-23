@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/encoding/protojson"
 
@@ -30,11 +32,15 @@ type IndexLookup interface {
 	LookupRange(ctx context.Context, from, to time.Time, sessionID string) ([]archive.Row, error)
 }
 
-// RestoredSpan — восстановленный спан с денормализованными service/scope.
+// RestoredSpan — восстановленный спан с денормализованными service/scope и полным
+// resource/scope (T0). Resource/ScopeFull nil для тонких спанов старого формата
+// (без этих полей) — тогда доступны только денормализованные service/scope-строки.
 type RestoredSpan struct {
-	Service string
-	Scope   string
-	Span    *tracepb.Span
+	Service   string
+	Scope     string
+	Resource  *resourcepb.Resource           // полный resource (service.version и пр.)
+	ScopeFull *commonpb.InstrumentationScope // полный scope: name+version+attributes
+	Span      *tracepb.Span
 }
 
 // Trace — полный восстановленный трейс.
@@ -65,10 +71,13 @@ func New(index IndexLookup, bundles dedup.BlobStore, cas dedup.ChunkSource) (*Re
 func (r *Restorer) Close() { r.dec.Close() }
 
 // thinEnvelope — тонкий спан из бандла: service/scope + protojson спана с ref.
+// Resource/ScopeFull (T0) — полные resource/scope, optional (старые бандлы без них).
 type thinEnvelope struct {
-	Service string          `json:"service"`
-	Scope   string          `json:"scope"`
-	Span    json.RawMessage `json:"span"`
+	Service   string          `json:"service"`
+	Scope     string          `json:"scope"`
+	Resource  json.RawMessage `json:"resource,omitempty"`
+	ScopeFull json.RawMessage `json:"scope_full,omitempty"`
+	Span      json.RawMessage `json:"span"`
 }
 
 // Restore восстанавливает трейс по trace_id. Растянутый по часам трейс лежит в
@@ -123,36 +132,77 @@ func (r *Restorer) RestoreRange(ctx context.Context, from, to time.Time, session
 	return out, nil
 }
 
-// restoreFrame: range-read фрейма трейса из бандла -> zstd decode -> строки тонких
-// спанов -> protojson + резолв рефов из CAS -> восстановленные спаны.
-func (r *Restorer) restoreFrame(ctx context.Context, row archive.Row, cas dedup.ChunkSource) ([]RestoredSpan, error) {
-	frame, err := r.bundles.GetRange(ctx, row.BundleKey, int64(row.Offset), int(row.Len))
-	if err != nil {
-		return nil, fmt.Errorf("restore: range-read %s: %w", row.BundleKey, err)
+// DecodeThinLine разбирает ОДНУ строку тонкого спана (JSON-конверт) в RestoredSpan
+// с рефами ВНУТРИ (не резолвит). Это форма записи в spans.thin (Kafka) — её же
+// читает SDK-стрим. Рефы резолвятся по требованию (dedup.RestoreSpan / SDK).
+func DecodeThinLine(line []byte) (RestoredSpan, error) {
+	var env thinEnvelope
+	if err := json.Unmarshal(line, &env); err != nil {
+		return RestoredSpan{}, fmt.Errorf("restore: envelope: %w", err)
 	}
-	data, err := r.dec.DecodeAll(frame, nil)
+	span := &tracepb.Span{}
+	if err := protojson.Unmarshal(env.Span, span); err != nil {
+		return RestoredSpan{}, fmt.Errorf("restore: protojson спана: %w", err)
+	}
+	rs := RestoredSpan{Service: env.Service, Scope: env.Scope, Span: span}
+	if len(env.Resource) > 0 {
+		res := &resourcepb.Resource{}
+		if err := protojson.Unmarshal(env.Resource, res); err != nil {
+			return RestoredSpan{}, fmt.Errorf("restore: protojson resource: %w", err)
+		}
+		rs.Resource = res
+	}
+	if len(env.ScopeFull) > 0 {
+		sc := &commonpb.InstrumentationScope{}
+		if err := protojson.Unmarshal(env.ScopeFull, sc); err != nil {
+			return RestoredSpan{}, fmt.Errorf("restore: protojson scope: %w", err)
+		}
+		rs.ScopeFull = sc
+	}
+	return rs, nil
+}
+
+// DecodeThinFrame разбирает один zstd-фрейм бандла (сырые байты фрейма) в тонкие
+// спаны: zstd decode -> JSONL -> DecodeThinLine на строку. Рефы НЕ резолвятся —
+// это ленивый нижний слой, общий для жадного restore (который затем зовёт
+// dedup.RestoreSpan) и SDK (internal/tf, резолвит контент по требованию).
+// Декодер передаётся аргументом: у каждого владельца свой, без общего состояния.
+func DecodeThinFrame(dec *zstd.Decoder, frame []byte) ([]RestoredSpan, error) {
+	data, err := dec.DecodeAll(frame, nil)
 	if err != nil {
-		return nil, fmt.Errorf("restore: decode фрейма %s: %w", row.BundleKey, err)
+		return nil, fmt.Errorf("restore: decode фрейма: %w", err)
 	}
 	var out []RestoredSpan
 	for _, ln := range bytes.Split(data, []byte("\n")) {
 		if len(ln) == 0 {
 			continue
 		}
-		var env thinEnvelope
-		if err := json.Unmarshal(ln, &env); err != nil {
-			return nil, fmt.Errorf("restore: envelope: %w", err)
-		}
-		span := &tracepb.Span{}
-		if err := protojson.Unmarshal(env.Span, span); err != nil {
-			return nil, fmt.Errorf("restore: protojson спана: %w", err)
-		}
-		if err := dedup.RestoreSpan(ctx, span, cas); err != nil {
+		rs, err := DecodeThinLine(ln)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, RestoredSpan{Service: env.Service, Scope: env.Scope, Span: span})
+		out = append(out, rs)
 	}
 	return out, nil
+}
+
+// restoreFrame: range-read фрейма трейса из бандла -> DecodeThinFrame -> резолв
+// рефов из CAS (жадный путь одиночного/диапазонного restore).
+func (r *Restorer) restoreFrame(ctx context.Context, row archive.Row, cas dedup.ChunkSource) ([]RestoredSpan, error) {
+	frame, err := r.bundles.GetRange(ctx, row.BundleKey, int64(row.Offset), int(row.Len))
+	if err != nil {
+		return nil, fmt.Errorf("restore: range-read %s: %w", row.BundleKey, err)
+	}
+	spans, err := DecodeThinFrame(r.dec, frame)
+	if err != nil {
+		return nil, err
+	}
+	for i := range spans {
+		if err := dedup.RestoreSpan(ctx, spans[i].Span, cas); err != nil {
+			return nil, err
+		}
+	}
+	return spans, nil
 }
 
 // cachingSource — декоратор ChunkSource с кэшем hash->байты на время одного окна.
