@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/contrib/processors/baggagecopy"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/baggage"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -44,6 +45,11 @@ type Config struct {
 	// ходов растёт. Транскрипт достигает десятков КБ с длинными общими префиксами —
 	// на таком FastCDC даёт партиал-дедуп, а whole-field почти нет (для сравнения в T8).
 	LongContent bool
+	// Realistic — вариативность под выразительные витрины (Sprint 04): разные причины
+	// завершения, finish_reasons, редкие error-статусы, think-time (ненулевой latency и
+	// разброс удержания). НЕ влияет на дедуплицируемый контент (systemа/диалог) — экономия
+	// дедупа не меняется. user.id и scam.type пишутся всегда (нужны витринам, дешёвые).
+	Realistic bool
 }
 
 // stats — атомарные счётчики прогона.
@@ -172,11 +178,12 @@ func (g *Generator) newTrace(ctx context.Context) bool {
 // остановиться.
 func (g *Generator) runSession(ctx context.Context, r *rand.Rand) bool {
 	sid := uuid.NewString()
+	uid := userIDs[r.IntN(len(userIDs))] // абонент из небольшого пула -> «обращения за N дней»
 	ver := "v3"
 	if r.IntN(2) == 0 {
 		ver = "v4"
 	}
-	sctx := baggage.ContextWithBaggage(ctx, mustBaggage(sid, ver))
+	sctx := baggage.ContextWithBaggage(ctx, mustBaggage(sid, ver, uid))
 
 	// Сессию считаем только после первого реально выданного токена.
 	if !g.newTrace(ctx) {
@@ -185,26 +192,49 @@ func (g *Generator) runSession(ctx context.Context, r *rand.Rand) bool {
 	atomic.AddInt64(&g.st.sessions, 1)
 	g.greeterTrace(sctx, r)
 
-	history := make([]message, 0, 20)
-	turns := 3 + r.IntN(8) // 3..10
-	if g.cfg.LongContent {
-		turns = 8 + r.IntN(8) // 8..15 ходов -> транскрипт до ~75 КБ
+	// Сценарий завершения выбирается на сессию: задаёт число ходов и «хвост» диалога
+	// (сигналы для классификатора причин, T6). Без -realistic все сессии «исчерпаны».
+	end := endExhausted
+	if g.cfg.Realistic {
+		end = pickEndScenario(r)
 	}
+	turns := g.turnsFor(end, r)
+
+	history := make([]message, 0, 20)
 	for i := 0; i < turns; i++ {
 		if !g.newTrace(ctx) {
 			return false
 		}
-		g.dialogTrace(sctx, r, ver, &history)
+		g.dialogTrace(sctx, r, ver, &history, turnOpts{end: end, last: i == turns-1})
 	}
 	return true
 }
 
-// mustBaggage собирает baggage из session.id и app.version. Ключи — валидные
-// W3C-токены, значения (uuid, "v3"/"v4").
-func mustBaggage(sid, ver string) baggage.Baggage {
+// turnsFor — число ходов под сценарий завершения (короткий обрыв vs исчерпание).
+func (g *Generator) turnsFor(end endScenario, r *rand.Rand) int {
+	switch end {
+	case endHungUp:
+		return 2 + r.IntN(2) // 2..3 — спамер бросил рано
+	case endExhausted:
+		if g.cfg.LongContent {
+			return 12 + r.IntN(4) // 12..15
+		}
+		return 8 + r.IntN(3) // 8..10 — удержание сработало
+	default:
+		if g.cfg.LongContent {
+			return 8 + r.IntN(8) // 8..15
+		}
+		return 3 + r.IntN(8) // 3..10
+	}
+}
+
+// mustBaggage собирает baggage из session.id, app.version и user.id. Ключи —
+// валидные W3C-токены; значения размазываются по всем спанам сессии BaggageSpanProcessor'ом.
+func mustBaggage(sid, ver, uid string) baggage.Baggage {
 	m1, _ := baggage.NewMember("session.id", sid)
 	m2, _ := baggage.NewMember("app.version", ver)
-	b, _ := baggage.New(m1, m2)
+	m3, _ := baggage.NewMember("user.id", uid)
+	b, _ := baggage.New(m1, m2, m3)
 	return b
 }
 
@@ -219,6 +249,13 @@ func (g *Generator) greeterTrace(ctx context.Context, r *rand.Rand) {
 	atomic.AddInt64(&g.st.spans, 1)
 }
 
+// turnOpts — параметры одного хода: сценарий завершения сессии и признак последнего
+// хода (на нём проявляется «хвост» — обрыв, глупость агента, прощание спамера).
+type turnOpts struct {
+	end  endScenario
+	last bool
+}
+
 // dialogTrace строит дерево одного хода диалога:
 //
 //	agent_turn (dialog-agent, root)
@@ -227,20 +264,24 @@ func (g *Generator) greeterTrace(ctx context.Context, r *rand.Rand) {
 //	└── chat qwen-lite    (extractor, ~35% случаев) — тот же trace_id, другой ресурс
 //
 // history растёт от хода к ходу — это будущая цель FastCDC.
-func (g *Generator) dialogTrace(ctx context.Context, r *rand.Rand, ver string, history *[]message) {
+func (g *Generator) dialogTrace(ctx context.Context, r *rand.Rand, ver string, history *[]message, opts turnOpts) {
 	tctx, root := g.tr[svcDialog].Start(ctx, "agent_turn")
 	spanCount := int64(1)
 
 	_, cls := g.tr[svcDialog].Start(tctx, "classify_intent")
 	cls.SetAttributes(
-		attribute.String("intent.label", intents[r.IntN(len(intents))]),
+		attribute.String("intent.label", g.intentFor(r, opts)),
 		attribute.Float64("intent.confidence", 0.5+r.Float64()*0.5),
 	)
 	cls.End()
 	spanCount++
 
-	// Реплика спамера дополняет растущий префикс диалога.
+	// Реплика спамера дополняет растущий префикс диалога; на прощальном хвосте —
+	// маркерная реплика «закругления», которую ловит классификатор причин.
 	phrase := spammerPhrases[r.IntN(len(spammerPhrases))]
+	if g.cfg.Realistic && opts.last && opts.end == endSpammerBye {
+		phrase = byePhrases[r.IntN(len(byePhrases))]
+	}
 	reply := agentReplies[r.IntN(len(agentReplies))]
 	if g.cfg.LongContent {
 		phrase = padTo(phrase, 2500)
@@ -249,15 +290,22 @@ func (g *Generator) dialogTrace(ctx context.Context, r *rand.Rand, ver string, h
 	*history = append(*history, message{Role: "user", Content: phrase})
 
 	_, chat := g.tr[svcDialog].Start(tctx, "chat gpt-4o-mini")
-	g.applyLLM(chat, r, ver, *history, reply, "gpt-4o-mini", "openai")
+	g.applyLLM(chat, r, ver, *history, reply, "gpt-4o-mini", "openai", g.finishFor(r, opts))
+	g.think(r) // think-time -> ненулевой latency и разброс удержания (реалистичность)
+	if g.cfg.Realistic && opts.last && opts.end == endConnLost {
+		chat.SetStatus(codes.Error, "upstream connection reset")
+	}
 	chat.End()
 	spanCount++
 	*history = append(*history, message{Role: "assistant", Content: reply})
 
 	// Иногда параллельно отрабатывает extractor на своей модели/ресурсе.
 	if r.Float64() < 0.35 {
+		k := r.IntN(len(extractorOutputs))
 		_, ex := g.tr[svcExtractor].Start(tctx, "chat qwen-lite")
-		g.applyLLM(ex, r, ver, *history, extractorOutputs[r.IntN(len(extractorOutputs))], "qwen-lite", "alibaba")
+		g.applyLLM(ex, r, ver, *history, extractorOutputs[k], "qwen-lite", "alibaba", "stop")
+		// scam.type денормализуем на спан (из JSON-выхода) — витрине не нужен CAS.
+		ex.SetAttributes(attribute.String("scam.type", extractorScamTypes[k]))
 		ex.End()
 		spanCount++
 	}
@@ -267,10 +315,52 @@ func (g *Generator) dialogTrace(ctx context.Context, r *rand.Rand, ver string, h
 	atomic.AddInt64(&g.st.spans, spanCount)
 }
 
+// intentFor — метка намерения; на прощальном хвосте — "goodbye".
+func (g *Generator) intentFor(r *rand.Rand, opts turnOpts) string {
+	if g.cfg.Realistic && opts.last && opts.end == endSpammerBye {
+		return "goodbye"
+	}
+	return intents[r.IntN(len(intents))]
+}
+
+// finishFor — причина остановки генерации: обычно "stop"; на хвосте «агент сглупил» —
+// content_filter/length. Случайная вариативность — только на НЕ-последних ходах, чтобы
+// сигнал последнего хода (его читает классификатор) оставался чистым.
+func (g *Generator) finishFor(r *rand.Rand, opts turnOpts) string {
+	if !g.cfg.Realistic {
+		return "stop"
+	}
+	if opts.last {
+		if opts.end == endAgentConfused {
+			if r.IntN(2) == 0 {
+				return "content_filter"
+			}
+			return "length"
+		}
+		return "stop"
+	}
+	if r.Float64() < 0.05 { // распределение finish_reason в витрине (не влияет на классификатор)
+		return "length"
+	}
+	return "stop"
+}
+
+// think — небольшая думающая пауза LLM-спана (реалистичный latency и разброс удержания).
+func (g *Generator) think(r *rand.Rand) {
+	if !g.cfg.Realistic {
+		return
+	}
+	d := time.Duration(8+r.IntN(40)) * time.Millisecond
+	if r.Float64() < 0.1 { // редкий «долгий» ход -> хвост распределения удержания
+		d += time.Duration(150+r.IntN(350)) * time.Millisecond
+	}
+	time.Sleep(d)
+}
+
 // applyLLM раскладывает контент LLM на спан согласно выбранной схеме и добавляет
 // числовые/метаданные атрибуты (пища для P3). Дедуп-кандидаты (system, input,
 // output) прогоняются через strAttr, чтобы попасть в счётчик текстовых байт.
-func (g *Generator) applyLLM(span trace.Span, r *rand.Rand, ver string, msgs []message, output, model, provider string) {
+func (g *Generator) applyLLM(span trace.Span, r *rand.Rand, ver string, msgs []message, output, model, provider, finish string) {
 	sys := systemInstructions[ver]
 	switch g.cfg.Schema {
 	case "A": // deprecated, но массовая: плоские gen_ai.prompt.{N} / gen_ai.completion.{N}
@@ -296,7 +386,7 @@ func (g *Generator) applyLLM(span trace.Span, r *rand.Rand, ver string, msgs []m
 		attribute.Float64("gen_ai.request.temperature", 0.2+r.Float64()*0.7),
 		attribute.Int("gen_ai.usage.input_tokens", estTokens(sys, msgs)),
 		attribute.Int("gen_ai.usage.output_tokens", len(output)/4),
-		attribute.StringSlice("gen_ai.response.finish_reasons", []string{"stop"}),
+		attribute.StringSlice("gen_ai.response.finish_reasons", []string{finish}),
 		attribute.String("gen_ai.provider.name", provider),
 	)
 }

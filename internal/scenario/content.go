@@ -3,6 +3,7 @@ package scenario
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 )
 
@@ -138,6 +139,60 @@ var extractorOutputs = []string{
 	`{"scam_type":"delivery_fee","risk":"low","asked_for":["payment"]}`,
 	`{"scam_type":"relative_in_trouble","risk":"high","asked_for":["cash"]}`,
 	`{"scam_type":"investment","risk":"medium","asked_for":["deposit"]}`,
+}
+
+// extractorScamTypes — тип мошенничества, выровненный по индексу с extractorOutputs;
+// денормализуется на спан extractor как scam.type (витрине не нужно парсить JSON/CAS).
+var extractorScamTypes = []string{
+	"fake_bank", "prize_fraud", "safe_account", "gov_services",
+	"delivery_fee", "relative_in_trouble", "investment",
+}
+
+// userIDs — небольшой пул «абонентов»: одна сессия = звонок одного абонента.
+// Малый пул -> у абонента набирается несколько обращений за период (витрина T5).
+var userIDs = func() []string {
+	ids := make([]string, 40)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("+7900%07d", 1000000+i)
+	}
+	return ids
+}()
+
+// byePhrases — «закругляющие» реплики спамера: на них классификатор причин ставит
+// spammer_hung_up. Содержат маркеры из byeMarkers классификатора (cmd/batchjob).
+var byePhrases = []string{
+	"Ладно, всего доброго, я вам перезвоню позже.",
+	"Спасибо, не надо, до свидания.",
+	"Мне это не интересно, кладу трубку.",
+	"Хорошего дня, отключаюсь.",
+	"Не интересно, перезвоните в другой раз.",
+}
+
+// endScenario — сценарий завершения сессии (задаёт число ходов и «хвост» диалога).
+type endScenario int
+
+const (
+	endExhausted     endScenario = iota // диалог исчерпан (удержание сработало) — доминирует
+	endSpammerBye                       // спамер закруглился прощальной репликой
+	endHungUp                           // спамер бросил рано (короткая сессия)
+	endConnLost                         // связь оборвалась (error-статус на последнем ходу)
+	endAgentConfused                    // агент сглупил (finish content_filter/length)
+)
+
+// pickEndScenario — взвешенный выбор: чаще исчерпание, реже обрывы/сбои.
+func pickEndScenario(r *rand.Rand) endScenario {
+	switch x := r.Float64(); {
+	case x < 0.45:
+		return endExhausted
+	case x < 0.65:
+		return endSpammerBye
+	case x < 0.82:
+		return endHungUp
+	case x < 0.93:
+		return endAgentConfused
+	default:
+		return endConnLost
+	}
 }
 
 // intents — метки для спана classify_intent.
