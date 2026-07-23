@@ -100,6 +100,16 @@ func (ix *Index) LookupRange(ctx context.Context, from, to time.Time, sessionID 
 	return scanRows(rows)
 }
 
+// LookupSession возвращает все фреймы сессии (по всем её трейсам/часам),
+// отсортированные по времени события — под LoadSession в SDK.
+func (ix *Index) LookupSession(ctx context.Context, sessionID string) ([]Row, error) {
+	rows, err := ix.conn.Query(ctx, selectCols+` WHERE session_id = ? ORDER BY ts`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("archive: lookup session %s: %w", sessionID, err)
+	}
+	return scanRows(rows)
+}
+
 // SampleTraceIDs возвращает до n различных trace_id из индекса (для verify-джоба и
 // смоука — взять образцы для проверки восстановимости).
 func (ix *Index) SampleTraceIDs(ctx context.Context, n int) ([]string, error) {
